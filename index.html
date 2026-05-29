@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Spline Instrument</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a0f; color: #e0e0e0; font-family: 'Courier New', monospace; overflow: hidden; height: 100vh; }
+  canvas { display: block; }
+  #ui { position: absolute; top: 10px; left: 10px; z-index: 10; }
+  #ui button, #ui select { background: #1a1a2e; color: #8f8; border: 1px solid #333; padding: 6px 12px; cursor: pointer; font-family: inherit; font-size: 12px; margin: 2px; }
+  #ui button:hover { background: #2a2a4e; }
+  #info { position: absolute; bottom: 10px; left: 10px; z-index: 10; color: #555; font-size: 11px; }
+  #freq { position: absolute; top: 10px; right: 10px; z-index: 10; color: #8f8; font-size: 14px; text-align: right; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="ui">
+  <button onclick="clearPoints()">Clear</button>
+  <button onclick="addHarmonic()">Add Harmonic</button>
+  <button onclick="togglePlay()">Play Sound</button>
+  <button onclick="toggleTrail()">Toggle Trail</button>
+  <select id="mode" onchange="setMode(this.value)">
+    <option value="spline">Spline Sculpt</option>
+    <option value="fourier">Fourier Paint</option>
+    <option value="laplacian">Laplacian Wave</option>
+  </select>
+</div>
+<div id="freq"></div>
+<div id="info">Click & drag to sculpt waveforms. Scroll to zoom. Right-click to delete points. The spline IS the sound.</div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const freqDiv = document.getElementById('freq');
+
+let W, H;
+function resize() { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; }
+resize();
+window.addEventListener('resize', resize);
+
+// State
+let points = []; // {x, y} in normalized [0,1] x [0,1]
+let dragging = -1;
+let playing = false;
+let showTrail = true;
+let audioCtx = null;
+let oscillator = null;
+let gainNode = null;
+let mode = 'spline';
+let trailPoints = [];
+let time = 0;
+let mouseX = 0, mouseY = 0;
+
+// Mouse
+canvas.addEventListener('mousedown', e => {
+  const nx = e.clientX / W;
+  const ny = e.clientY / H;
+  if (e.button === 2) { // right click - delete nearest
+    let minD = Infinity, minI = -1;
+    points.forEach((p, i) => { const d = (p.x-nx)**2 + (p.y-ny)**2; if (d < minD) { minD = d; minI = i; } });
+    if (minD < 0.001 && minI >= 0) points.splice(minI, 1);
+    return;
+  }
+  // Check if near existing point
+  let near = -1;
+  points.forEach((p, i) => { if ((p.x-nx)**2 + (p.y-ny)**2 < 0.001) near = i; });
+  if (near >= 0) { dragging = near; } 
+  else { points.push({x: nx, y: ny}); points.sort((a,b) => a.x - b.x); dragging = points.findIndex(p => p.x === nx && p.y === ny); }
+});
+canvas.addEventListener('mousemove', e => {
+  mouseX = e.clientX / W; mouseY = e.clientY / H;
+  if (dragging >= 0 && dragging < points.length) {
+    points[dragging].x = Math.max(0, Math.min(1, e.clientX / W));
+    points[dragging].y = Math.max(0, Math.min(1, e.clientY / H));
+    points.sort((a,b) => a.x - b.x);
+  }
+});
+canvas.addEventListener('mouseup', () => { dragging = -1; });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// Spline interpolation (cubic Catmull-Rom)
+function catmullRom(p0, p1, p2, p3, t) {
+  const t2 = t*t, t3 = t2*t;
+  return 0.5 * ((2*p1) + (-p0+p2)*t + (2*p0-5*p1+4*p2-p3)*t2 + (-p0+3*p1-3*p2+p3)*t3);
+}
+
+function evaluateSpline(t) {
+  if (points.length < 2) return points.length === 1 ? points[0].y : 0.5;
+  t = Math.max(0, Math.min(1, t));
+  const n = points.length - 1;
+  const ft = t * n;
+  const i = Math.min(Math.floor(ft), n - 1);
+  const frac = ft - i;
+  const p0 = points[Math.max(0, i-1)].y;
+  const p1 = points[i].y;
+  const p2 = points[Math.min(n, i+1)].y;
+  const p3 = points[Math.min(n, i+2)].y;
+  return catmullRom(p0, p1, p2, p3, frac);
+}
+
+// Fourier mode: treat points as harmonics {x=freq, y=amplitude}
+function evaluateFourier(t) {
+  if (points.length === 0) return 0.5;
+  let sum = 0;
+  points.forEach((p, i) => {
+    const freq = Math.max(1, Math.round(p.x * 16)); // 1-16 harmonics
+    const amp = (0.5 - p.y) * 2; // -1 to 1
+    sum += amp * Math.sin(2 * Math.PI * freq * t + i * 0.3);
+  });
+  return 0.5 + sum / Math.max(points.length, 1) * 0.5;
+}
+
+// Laplacian mode: points are nodes, edges connect neighbors, wave propagation
+let lapState = [];
+function initLaplacian() {
+  lapState = points.map(p => ({pos: 0.5 - p.y, vel: 0}));
+}
+function stepLaplacian(dt) {
+  if (points.length < 2) return;
+  const damping = 0.999;
+  const stiffness = 50;
+  const forces = lapState.map(() => 0);
+  // Coupling between neighbors
+  for (let i = 0; i < points.length; i++) {
+    if (i > 0) forces[i] += stiffness * (lapState[i-1].pos - lapState[i].pos);
+    if (i < points.length-1) forces[i] += stiffness * (lapState[i+1].pos - lapState[i].pos);
+    // Driving force from y position
+    forces[i] += stiffness * 0.5 * ((0.5 - points[i].y) - lapState[i].pos);
+  }
+  for (let i = 0; i < lapState.length; i++) {
+    lapState[i].vel += forces[i] * dt;
+    lapState[i].vel *= damping;
+    lapState[i].pos += lapState[i].vel * dt;
+  }
+}
+function evaluateLaplacian(t) {
+  if (points.length === 0) return 0.5;
+  stepLaplacian(0.001);
+  // Interpolate between node positions
+  if (points.length === 1) return 0.5 - lapState[0].pos;
+  const ft = t * (points.length - 1);
+  const i = Math.min(Math.floor(ft), points.length - 2);
+  const frac = ft - i;
+  const v1 = lapState[i].pos;
+  const v2 = lapState[i+1].pos;
+  return 0.5 - (v1 * (1-frac) + v2 * frac);
+}
+
+function evaluate(t) {
+  if (mode === 'spline') return evaluateSpline(t);
+  if (mode === 'fourier') return evaluateFourier(t);
+  if (mode === 'laplacian') return evaluateLaplacian(t);
+  return 0.5;
+}
+
+// Audio
+function togglePlay() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    gainNode = audioCtx.createGain();
+    gainNode.gain.value = 0;
+    gainNode.connect(audioCtx.destination);
+  }
+  playing = !playing;
+  if (playing) {
+    oscillator = audioCtx.createOscillator();
+    oscillator.type = 'custom';
+    const real = new Float32Array(32);
+    const imag = new Float32Array(32);
+    // Build Fourier coefficients from spline
+    for (let k = 1; k < 32; k++) {
+      let sum = 0;
+      for (let i = 0; i < 100; i++) {
+        const t = i / 100;
+        const v = evaluate(t) - 0.5;
+        sum += v * Math.sin(2 * Math.PI * k * t);
+      }
+      imag[k] = sum / 50;
+    }
+    real[0] = 0.5;
+    const wave = audioCtx.createPeriodicWave(real, imag);
+    oscillator.setPeriodicWave(wave);
+    oscillator.frequency.value = 220;
+    oscillator.connect(gainNode);
+    gainNode.gain.setTargetAtTime(0.15, audioCtx.currentTime, 0.1);
+    oscillator.start();
+  } else {
+    if (oscillator) {
+      gainNode.gain.setTargetAtTime(0, audioCtx.currentTime, 0.1);
+      setTimeout(() => { try { oscillator.stop(); } catch(e) {} oscillator = null; }, 200);
+    }
+  }
+}
+
+function toggleTrail() { showTrail = !showTrail; trailPoints = []; }
+function clearPoints() { points = []; trailPoints = []; lapState = []; }
+function addHarmonic() {
+  const x = Math.random() * 0.8 + 0.1;
+  const y = Math.random() * 0.6 + 0.1;
+  points.push({x, y});
+  points.sort((a,b) => a.x - b.x);
+  if (mode === 'laplacian') initLaplacian();
+}
+function setMode(m) { 
+  mode = m; 
+  trailPoints = []; 
+  if (m === 'laplacian') initLaplacian(); 
+}
+
+// Colors
+function hsl(h, s, l) { return `hsl(${h},${s}%,${l}%)`; }
+
+// Draw
+function draw() {
+  time += 0.005;
+  ctx.fillStyle = 'rgba(10,10,15,0.15)';
+  ctx.fillRect(0, 0, W, H);
+
+  const margin = 40;
+  const gW = W - margin * 2;
+  const gH = H - margin * 2;
+
+  // Grid
+  ctx.strokeStyle = '#1a1a2e';
+  ctx.lineWidth = 0.5;
+  for (let i = 0; i <= 10; i++) {
+    const x = margin + gW * i / 10;
+    const y = margin + gH * i / 10;
+    ctx.beginPath(); ctx.moveTo(x, margin); ctx.lineTo(x, margin + gH); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(margin, y); ctx.lineTo(margin + gW, y); ctx.stroke();
+  }
+
+  // The waveform itself
+  if (points.length >= 1) {
+    const scanT = (time * 0.3) % 1;
+    
+    // Draw the full waveform
+    ctx.beginPath();
+    ctx.lineWidth = 2;
+    for (let px = 0; px <= gW; px++) {
+      const t = px / gW;
+      const v = evaluate(t);
+      const x = margin + px;
+      const y = margin + gH * (1 - v);
+      if (px === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    // Color based on the mode
+    const gradient = ctx.createLinearGradient(margin, 0, margin + gW, 0);
+    gradient.addColorStop(0, '#0a4');
+    gradient.addColorStop(0.5, '#0af');
+    gradient.addColorStop(1, '#a0f');
+    ctx.strokeStyle = gradient;
+    ctx.stroke();
+
+    // Glow effect
+    ctx.globalAlpha = 0.3;
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = gradient;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = 2;
+
+    // Scanning dot
+    const scanX = margin + gW * scanT;
+    const scanV = evaluate(scanT);
+    const scanY = margin + gH * (1 - scanV);
+    
+    // Trail from scanning dot
+    if (showTrail) {
+      trailPoints.push({x: scanX, y: scanY, age: 0});
+      if (trailPoints.length > 200) trailPoints.shift();
+      trailPoints.forEach((p, i) => {
+        p.age += 0.02;
+        const alpha = Math.max(0, 1 - p.age);
+        ctx.fillStyle = `rgba(0,255,136,${alpha * 0.5})`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    }
+
+    // The dot itself
+    ctx.beginPath();
+    ctx.arc(scanX, scanY, 6, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(scanX, scanY, 10, 0, Math.PI * 2);
+    ctx.strokeStyle = '#0af';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Frequency display
+    const freq = Math.round(220 * (1 + scanV * 2));
+    const cr = points.length > 1 ? computeCR().toFixed(3) : '—';
+    freqDiv.innerHTML = `freq: ${freq} Hz<br>CR: ${cr}<br>nodes: ${points.length}<br>mode: ${mode}`;
+  }
+
+  // Draw control points
+  points.forEach((p, i) => {
+    const px = margin + gW * p.x;
+    const py = margin + gH * (1 - p.y);
+    
+    // Glow
+    ctx.beginPath();
+    ctx.arc(px, py, 12, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0,170,255,0.15)';
+    ctx.fill();
+    
+    // Point
+    ctx.beginPath();
+    ctx.arc(px, py, 5, 0, Math.PI * 2);
+    ctx.fillStyle = i === dragging ? '#fff' : '#0af';
+    ctx.fill();
+    ctx.strokeStyle = '#0a4';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  });
+
+  // Mouse follower (show what value you'd place)
+  if (dragging < 0) {
+    const px = margin + gW * mouseX;
+    const py = margin + gH * (1 - mouseY);
+    ctx.beginPath();
+    ctx.arc(px, py, 3, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.fill();
+  }
+
+  requestAnimationFrame(draw);
+}
+
+// Simple CR computation from the waveform
+function computeCR() {
+  if (points.length < 2) return 0;
+  // Treat the spline as a signal, compute spectral flatness
+  const N = 64;
+  const signal = [];
+  for (let i = 0; i < N; i++) signal.push(evaluate(i / N));
+  // DFT magnitudes
+  const mags = [];
+  for (let k = 0; k < N/2; k++) {
+    let re = 0, im = 0;
+    for (let n = 0; n < N; n++) {
+      re += signal[n] * Math.cos(2*Math.PI*k*n/N);
+      im -= signal[n] * Math.sin(2*Math.PI*k*n/N);
+    }
+    mags.push(re*re + im*im);
+  }
+  const sorted = [...mags].sort((a,b) => a-b);
+  if (sorted.length < 2) return 0;
+  return sorted[1] / sorted[sorted.length-1];
+}
+
+// Seed with a default curve
+points = [
+  {x: 0.1, y: 0.5},
+  {x: 0.3, y: 0.2},
+  {x: 0.5, y: 0.7},
+  {x: 0.7, y: 0.3},
+  {x: 0.9, y: 0.5}
+];
+
+draw();
+</script>
+</body>
+</html>
